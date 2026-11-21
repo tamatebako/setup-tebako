@@ -8,6 +8,16 @@ name: test
 # no-op re-download). The cache-hit job then restores the exact store
 # key a previous job in this run saved — the living proof that
 # actions/cache's post-job save fires from inside a composite action.
+#
+# The registry ref is the TAGGED release-artifact form: the feedstock's
+# default-branch tpkg-registry.yaml (what the untagged ref reads) still
+# pins release 2.12.2, whose x86_64-windows-ucrt artifact predates the
+# self-description check (its embedded manifest's tree_hash does not
+# match the image's merkle root — install fails closed, exit 65; the
+# artifact was rebuilt in 2.12.2-1 and passes). The tagged form names
+# the registry file as a 2.12.2-1 release artifact. Simplify back to
+# the untagged tfs:github:tebako-packages/hello once the feedstock's
+# main document points at the rebuilt release.
 
 on:
   push:
@@ -45,7 +55,7 @@ jobs:
         id: setup
         uses: ./
         with:
-          registries: tfs:github:tebako-packages/hello
+          registries: tfs:github:tebako-packages/hello:2.12.2-1#tpkg-registry.yaml
           payloads: hello
 
       - name: Outputs answer (posix)
@@ -169,7 +179,7 @@ jobs:
         id: setup
         uses: ./
         with:
-          registries: tfs:github:tebako-packages/hello
+          registries: tfs:github:tebako-packages/hello:2.12.2-1#tpkg-registry.yaml
           payloads: hello
 
       - name: The exact store key hit
