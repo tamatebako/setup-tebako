@@ -85,8 +85,16 @@ them; a repo without either file gets a stable per-version key.
 
 The save runs as the cache action's post-job step, registered from
 inside the composite — it fires at the end of the calling job, and only
-when the exact key does not already exist. The self-test workflow's
-`cache-hit` job asserts a real hit on every run.
+when the exact key does not already exist (a failed job saves nothing).
+The self-test workflow's `cache-hit` job asserts a real hit on every
+run.
+
+The cached store carries your registered registries with it. Re-adding
+the same registry ref is idempotent, but changing the `registries`
+input to a *different* document that derives the same alias collides
+with the restored config (`DuplicateRegistryAlias`, exit 65): name the
+new registry explicitly (`tebako add-registry <ref> --name <alias>`) or
+bump `cache-key-suffix` to start from a fresh store.
 
 ## Examples
 
