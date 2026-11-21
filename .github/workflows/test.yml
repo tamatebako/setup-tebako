@@ -1,0 +1,190 @@
+name: test
+
+# The action's own acceptance suite: the action installs the published
+# tebako CLI on each hosted platform, registers the hello feedstock's
+# registry, installs the published hello payload (kind: toolkit — no
+# runtime download), and dispatches it through the registered shim. A
+# second in-job install proves the store path (already-installed is a
+# no-op re-download). The cache-hit job then restores the exact store
+# key a previous job in this run saved — the living proof that
+# actions/cache's post-job save fires from inside a composite action.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# One run per branch/PR-head at a time; a new run cancels the stale one.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  # The resolver's authenticated tier (TEBAKO_GITHUB_TOKEN — the ambient
+  # GitHub credential): the registry fetch + payload download ride the
+  # live API/releases, and the CI NAT pool's shared anonymous bucket is
+  # a known flake source (hello-runtimes' engine-surface leg's lesson).
+  TEBAKO_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+jobs:
+  self-test:
+    name: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: setup-tebako (latest, hello payload)
+        id: setup
+        uses: ./
+        with:
+          registries: tfs:github:tebako-packages/hello
+          payloads: hello
+
+      - name: Outputs answer (posix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "version=${{ steps.setup.outputs.version }}"
+          echo "tebako-home=${{ steps.setup.outputs.tebako-home }}"
+          echo "cache-hit=${{ steps.setup.outputs.cache-hit }}"
+          grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+' <<<"${{ steps.setup.outputs.version }}"
+          [ -d "${{ steps.setup.outputs.tebako-home }}" ]
+
+      - name: Outputs answer (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Write-Host "version=${{ steps.setup.outputs.version }}"
+          Write-Host "tebako-home=${{ steps.setup.outputs.tebako-home }}"
+          Write-Host "cache-hit=${{ steps.setup.outputs.cache-hit }}"
+          if ('${{ steps.setup.outputs.version }}' -notmatch '^[0-9]+\.[0-9]+\.[0-9]+') { exit 1 }
+          if (-not (Test-Path '${{ steps.setup.outputs.tebako-home }}')) { exit 1 }
+
+      - name: tebako --version answers (posix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          command -v tebako
+          tebako --version
+
+      - name: tebako --version answers (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          (Get-Command tebako).Source
+          tebako --version
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
+      - name: The shim dispatches the installed payload (posix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          command -v hello
+          out="$(hello)"
+          echo "$out"
+          grep -q "Hello, world!" <<<"$out" \
+            || { echo "::error::the installed hello shim did not greet: $out"; exit 1; }
+
+      - name: The shim dispatches the installed payload (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          (Get-Command hello).Source
+          $out = & hello 2>&1 | Out-String
+          Write-Host $out
+          if ($out -notmatch 'Hello, world!') { Write-Host "::error::the installed hello shim did not greet: $out"; exit 1 }
+
+      - name: Second install hits the store (posix)
+        # Re-installing the same ref must succeed against the already-
+        # populated store (a no-op re-download, never an error), and the
+        # shim keeps dispatching.
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          [ -d "$HOME/.tebako/payloads/hello" ] \
+            || { echo "::error::the store holds no payloads/hello after install"; exit 1; }
+          tebako install hello
+          hello | grep -q "Hello, world!"
+
+      - name: Second install hits the store (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not (Test-Path "$env:LOCALAPPDATA\tebako\payloads\hello")) { Write-Host "::error::the store holds no payloads\hello after install"; exit 1 }
+          tebako install hello
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          $out = & hello 2>&1 | Out-String
+          if ($out -notmatch 'Hello, world!') { Write-Host "::error::second-install dispatch failed: $out"; exit 1 }
+
+  pinned-version:
+    # The explicit-version resolution path (the matrix above rides
+    # 'latest'). No payloads: this leg is the pin + install proof only.
+    name: pinned version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: "setup-tebako (version: 2.8.83)"
+        id: setup
+        uses: ./
+        with:
+          version: 2.8.83
+
+      - name: The pin resolved verbatim
+        shell: bash
+        run: |
+          set -euo pipefail
+          [ "${{ steps.setup.outputs.version }}" = "2.8.83" ] \
+            || { echo "::error::expected version 2.8.83, got '${{ steps.setup.outputs.version }}'"; exit 1; }
+          command -v tebako
+          tebako --version
+
+  cache-hit:
+    # needs: the full self-test matrix, so the ubuntu leg's post-job
+    # cache save has landed before this job restores. Same runner, same
+    # inputs, same lockfile hash context -> the exact key must hit.
+    name: store cache hit
+    needs: self-test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: setup-tebako (same key as the ubuntu self-test leg)
+        id: setup
+        uses: ./
+        with:
+          registries: tfs:github:tebako-packages/hello
+          payloads: hello
+
+      - name: The exact store key hit
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "cache-hit=${{ steps.setup.outputs.cache-hit }}"
+          [ "${{ steps.setup.outputs.cache-hit }}" = "true" ] \
+            || { echo "::error::expected a store cache hit on the second job — the composite-hosted cache save did not land (or the key drifted)"; exit 1; }
+
+      - name: The restored store dispatches
+        shell: bash
+        run: |
+          set -euo pipefail
+          [ -d "$HOME/.tebako/payloads/hello" ]
+          out="$(hello)"
+          echo "$out"
+          grep -q "Hello, world!" <<<"$out"

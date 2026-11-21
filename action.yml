@@ -1,0 +1,334 @@
+name: setup-tebako
+description: >-
+  Install the tebako CLI (version-pinnable, sha256-verified against the
+  release's own SHA256SUMS), restore the tebako store cache, and
+  optionally register registries and install payloads.
+author: riboseinc
+branding:
+  icon: package
+  color: red
+
+inputs:
+  version:
+    description: >-
+      tebako CLI version to install. 'latest' follows the newest
+      tamatebako/tebako release; anything else pins an exact release
+      (a leading 'v' is accepted and stripped).
+    required: false
+    default: latest
+  registries:
+    description: >-
+      Optional multiline list of registry refs to register before any
+      payload install, one per line ('tebako add-registry <ref>' per
+      line). Blank lines and lines starting with '#' are skipped. tebako
+      ships with zero registries by design — a payload install needs at
+      least one (e.g. tfs:github:tebako-packages/registry for the
+      official registry).
+    required: false
+    default: ''
+  payloads:
+    description: >-
+      Optional multiline list of payload refs to install after setup,
+      one per line ('tebako install <ref>' per line — any ref form the
+      CLI accepts, e.g. 'hello' or 'hello-ruby@1.0.12'). Blank lines and
+      lines starting with '#' are skipped.
+    required: false
+    default: ''
+  cache:
+    description: >-
+      Restore and save the tebako store (~/.tebako on Linux/macOS,
+      %LOCALAPPDATA%\tebako on Windows) via actions/cache. The store
+      holds runtimes and payloads, so a cached store is what makes
+      'tebako install' and shim dispatch fast on repeat runs.
+    required: false
+    default: 'true'
+  cache-key-suffix:
+    description: >-
+      Optional extra key segment, appended verbatim to the store cache
+      key right after the version segment. Start it with a separator
+      (e.g. '-experiment') — it is not hyphenated for you.
+    required: false
+    default: ''
+
+outputs:
+  version:
+    description: The resolved tebako CLI version (e.g. '2.8.83').
+    value: ${{ steps.install-posix.outputs.version || steps.install-windows.outputs.version }}
+  cache-hit:
+    description: >-
+      Passthrough of the store cache's cache-hit output: 'true' on an
+      exact key hit, 'false' on a restore-keys hit, '' on a miss or when
+      cache is 'false'.
+    value: ${{ steps.store-cache-posix.outputs.cache-hit || steps.store-cache-windows.outputs.cache-hit }}
+  tebako-home:
+    description: >-
+      The tebako home directory the CLI resolves to on this runner
+      (~/.tebako on Linux/macOS, %LOCALAPPDATA%\tebako on Windows).
+    value: ${{ steps.install-posix.outputs.tebako-home || steps.install-windows.outputs.tebako-home }}
+
+runs:
+  using: composite
+  steps:
+    # The store cache: one leg per OS family because the store root
+    # differs (spec 05 §3.1's platform default — ~/.tebako on POSIX,
+    # %LOCALAPPDATA%\tebako on Windows; actions/cache expands ~ but not
+    # %LOCALAPPDATA%). actions/cache's post-job save registers from
+    # inside a composite action and runs at end of job; the self-test
+    # workflow's cache-hit job is the living proof.
+    - name: Restore the tebako store
+      id: store-cache-posix
+      if: inputs.cache == 'true' && runner.os != 'Windows'
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ~/.tebako
+        key: ${{ runner.os }}-${{ runner.arch }}-tebako-store-${{ inputs.version }}${{ inputs.cache-key-suffix }}-${{ hashFiles('**/tebako.lock', '**/.tebako-tools.yaml') }}
+        restore-keys: |
+          ${{ runner.os }}-${{ runner.arch }}-tebako-store-${{ inputs.version }}${{ inputs.cache-key-suffix }}-
+          ${{ runner.os }}-${{ runner.arch }}-tebako-store-
+
+    - name: Restore the tebako store
+      id: store-cache-windows
+      if: inputs.cache == 'true' && runner.os == 'Windows'
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ~\AppData\Local\tebako
+        key: ${{ runner.os }}-${{ runner.arch }}-tebako-store-${{ inputs.version }}${{ inputs.cache-key-suffix }}-${{ hashFiles('**/tebako.lock', '**/.tebako-tools.yaml') }}
+        restore-keys: |
+          ${{ runner.os }}-${{ runner.arch }}-tebako-store-${{ inputs.version }}${{ inputs.cache-key-suffix }}-
+          ${{ runner.os }}-${{ runner.arch }}-tebako-store-
+
+    - name: Install the tebako CLI (sha256-verified)
+      id: install-posix
+      if: runner.os != 'Windows'
+      shell: bash
+      env:
+        INPUT_VERSION: ${{ inputs.version }}
+      run: |
+        set -euo pipefail
+
+        # --- resolve the version (latest rides the releases/latest ---
+        # --- redirect, never the rate-limited API) ---
+        raw="$INPUT_VERSION"
+        if [ "$raw" = "latest" ]; then
+          url="$(curl -fsS -o /dev/null -w '%{redirect_url}' \
+            --retry 5 --retry-all-errors --retry-delay 3 \
+            https://github.com/tamatebako/tebako/releases/latest)"
+          [ -n "$url" ] || { echo "::error::VersionResolutionFailed: github.com/tamatebako/tebako/releases/latest gave no redirect"; exit 1; }
+          tag="${url##*/}"
+        else
+          tag="v${raw#v}"
+        fi
+        ver="${tag#v}"
+        grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9.-]+)?$' <<<"$ver" \
+          || { echo "::error::MalformedVersion: '$raw' (want 'latest' or an X.Y.Z release)"; exit 1; }
+        echo "resolved tebako CLI version: $ver (input: $raw)"
+
+        # --- map the runner to the release's asset platform ---
+        # Asset spellings flow from the release itself:
+        #   tebako-<v>-linux-{gnu,musl}-{x86_64,arm64}
+        #   tebako-<v>-macos-{x86_64,arm64}
+        #   tebako-<v>-windows-ucrt64.exe        (pwsh step below)
+        case "$RUNNER_OS" in
+          Linux)
+            if ldd --version 2>&1 | grep -qi musl; then libc=musl; else libc=gnu; fi
+            case "$RUNNER_ARCH" in
+              X64)        plat="linux-$libc-x86_64" ;;
+              ARM64)      plat="linux-$libc-arm64" ;;
+              *) echo "::error::UnsupportedRunnerArch: Linux/$RUNNER_ARCH"; exit 1 ;;
+            esac
+            ;;
+          macOS)
+            case "$RUNNER_ARCH" in
+              X64)        plat="macos-x86_64" ;;
+              ARM64)      plat="macos-arm64" ;;
+              *) echo "::error::UnsupportedRunnerArch: macOS/$RUNNER_ARCH"; exit 1 ;;
+            esac
+            ;;
+          *) echo "::error::UnsupportedRunnerOS: $RUNNER_OS (this step is the POSIX leg)"; exit 1 ;;
+        esac
+
+        # --- download + verify against the release's own SHA256SUMS ---
+        base="https://github.com/tamatebako/tebako/releases/download/v$ver"
+        work="$(mktemp -d)"
+        trap 'rm -rf "$work"' EXIT
+        cd "$work"
+        assets=("tebako-$ver-$plat" "tebako-shim-$ver-$plat")
+        for a in "${assets[@]}" SHA256SUMS; do
+          curl -fsSLO --retry 5 --retry-all-errors --retry-delay 3 "$base/$a"
+        done
+        if command -v sha256sum >/dev/null 2>&1; then sum() { sha256sum "$1"; }
+        else sum() { shasum -a 256 "$1"; }
+        fi
+        for a in "${assets[@]}"; do
+          row="$(grep "  $a\$" SHA256SUMS || true)"
+          [ -n "$row" ] || { echo "::error::ChecksumPinMissing: the v$ver SHA256SUMS carries no row for $a"; exit 1; }
+          want="${row%% *}"
+          got="$(sum "$a" | cut -d' ' -f1)"
+          [ "$want" = "$got" ] || { echo "::error::ChecksumMismatch: $a — the release SHA256SUMS pins $want, the downloaded bytes hash $got"; exit 1; }
+          echo "sha256 OK: $a ($got)"
+        done
+
+        # --- install: CLI + shim side by side (the shim's dispatcher ---
+        # --- resolution is sibling-wise) ---
+        root="${RUNNER_TOOL_CACHE:-$RUNNER_TEMP/tebako-toolcache}/tebako/$ver/$RUNNER_ARCH"
+        mkdir -p "$root"
+        chmod +x "${assets[@]}"
+        mv "tebako-$ver-$plat" "$root/tebako"
+        mv "tebako-shim-$ver-$plat" "$root/tebako-shim"
+        echo "installed: $root/tebako ($(wc -c < "$root/tebako" | tr -d ' ') bytes), $root/tebako-shim"
+
+        echo "$root" >> "$GITHUB_PATH"
+        home="$HOME/.tebako"
+        mkdir -p "$home/shims"
+        echo "$home/shims" >> "$GITHUB_PATH"
+
+        "$root/tebako" --version
+        echo "version=$ver" >> "$GITHUB_OUTPUT"
+        echo "tebako-home=$home" >> "$GITHUB_OUTPUT"
+
+    - name: Install the tebako CLI (sha256-verified)
+      id: install-windows
+      if: runner.os == 'Windows'
+      shell: pwsh
+      env:
+        INPUT_VERSION: ${{ inputs.version }}
+      run: |
+        $ErrorActionPreference = 'Stop'
+
+        # --- resolve the version (latest rides the releases/latest ---
+        # --- redirect, never the rate-limited API) ---
+        $raw = $env:INPUT_VERSION
+        if ($raw -eq 'latest') {
+          $url = (& curl.exe -s -o NUL -w '%{redirect_url}' --retry 5 --retry-all-errors --retry-delay 3 https://github.com/tamatebako/tebako/releases/latest)
+          if ($LASTEXITCODE -ne 0 -or -not $url) { Write-Host "::error::VersionResolutionFailed: github.com/tamatebako/tebako/releases/latest gave no redirect"; exit 1 }
+          $tag = ($url -split '/')[-1]
+        } else {
+          $tag = 'v' + ($raw -replace '^v', '')
+        }
+        $ver = $tag -replace '^v', ''
+        if ($ver -notmatch '^[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9.-]+)?$') { Write-Host "::error::MalformedVersion: '$raw' (want 'latest' or an X.Y.Z release)"; exit 1 }
+        Write-Host "resolved tebako CLI version: $ver (input: $raw)"
+
+        # --- map the runner to the release's asset platform ---
+        # The release ships tebako/tebako-shim for windows-ucrt64 only
+        # (tebako-pkg, tfs and the runtime-launcher ship ucrt-arm64; the
+        # CLI pair does not). On ARM64 runners the x64 asset runs under
+        # Windows-on-ARM emulation — loudly, never silently.
+        switch ($env:RUNNER_ARCH) {
+          'X64'   { $plat = 'windows-ucrt64' }
+          'ARM64' {
+            Write-Host "::warning::no tebako CLI asset ships for windows-ucrt-arm64 — falling back to the x86_64 ucrt64 asset (runs under Windows-on-ARM emulation)"
+            $plat = 'windows-ucrt64'
+          }
+          default { Write-Host "::error::UnsupportedRunnerArch: Windows/$env:RUNNER_ARCH"; exit 1 }
+        }
+
+        # --- download + verify against the release's own SHA256SUMS ---
+        $base = "https://github.com/tamatebako/tebako/releases/download/v$ver"
+        $work = Join-Path $env:RUNNER_TEMP ("tebako-dl-" + [guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Force -Path $work | Out-Null
+        Push-Location $work
+        try {
+          $assets = @("tebako-$ver-$plat.exe", "tebako-shim-$ver-$plat.exe")
+          foreach ($a in @($assets) + @('SHA256SUMS')) {
+            & curl.exe -fsSLO --retry 5 --retry-all-errors --retry-delay 3 "$base/$a"
+            if ($LASTEXITCODE -ne 0) { Write-Host "::error::DownloadFailed: $base/$a (curl exit $LASTEXITCODE)"; exit 1 }
+          }
+          $sums = @{}
+          Get-Content SHA256SUMS | ForEach-Object {
+            if ($_ -match '^([0-9a-fA-F]{64})  (\S+)$') { $sums[$Matches[2]] = $Matches[1].ToLower() }
+          }
+          foreach ($a in $assets) {
+            if (-not $sums.ContainsKey($a)) { Write-Host "::error::ChecksumPinMissing: the v$ver SHA256SUMS carries no row for $a"; exit 1 }
+            $got = (Get-FileHash -Algorithm SHA256 $a).Hash.ToLower()
+            if ($sums[$a] -ne $got) { Write-Host "::error::ChecksumMismatch: $a — the release SHA256SUMS pins $($sums[$a]), the downloaded bytes hash $got"; exit 1 }
+            Write-Host "sha256 OK: $a ($got)"
+          }
+
+          # --- install: CLI + shim side by side (the shim's dispatcher ---
+          # --- resolution is sibling-wise) ---
+          $cacheRoot = if ($env:RUNNER_TOOL_CACHE) { $env:RUNNER_TOOL_CACHE } else { Join-Path $env:RUNNER_TEMP 'tebako-toolcache' }
+          $root = Join-Path $cacheRoot "tebako\$ver\$env:RUNNER_ARCH"
+          New-Item -ItemType Directory -Force -Path $root | Out-Null
+          Move-Item -Force "tebako-$ver-$plat.exe" (Join-Path $root 'tebako.exe')
+          Move-Item -Force "tebako-shim-$ver-$plat.exe" (Join-Path $root 'tebako-shim.exe')
+          Write-Host "installed: $root\tebako.exe ($((Get-Item (Join-Path $root 'tebako.exe')).Length) bytes), $root\tebako-shim.exe"
+
+          Add-Content $env:GITHUB_PATH $root
+          # The store root on Windows is %LOCALAPPDATA%\tebako, with
+          # %USERPROFILE%\.tebako as the fallback when LOCALAPPDATA is
+          # unset (spec 05 §3.1's platform default — NOT ~/.tebako).
+          $tebakoHome = if ($env:LOCALAPPDATA) { Join-Path $env:LOCALAPPDATA 'tebako' } else { Join-Path $env:USERPROFILE '.tebako' }
+          New-Item -ItemType Directory -Force -Path (Join-Path $tebakoHome 'shims') | Out-Null
+          Add-Content $env:GITHUB_PATH (Join-Path $tebakoHome 'shims')
+
+          & (Join-Path $root 'tebako.exe') --version
+          if ($LASTEXITCODE -ne 0) { Write-Host "::error::the installed tebako.exe failed --version ($LASTEXITCODE)"; exit 1 }
+          Add-Content $env:GITHUB_OUTPUT "version=$ver"
+          Add-Content $env:GITHUB_OUTPUT "tebako-home=$tebakoHome"
+        } finally {
+          Pop-Location
+          Remove-Item -Recurse -Force $work -ErrorAction SilentlyContinue
+        }
+
+    - name: Register registries + install payloads
+      if: runner.os != 'Windows' && (inputs.registries != '' || inputs.payloads != '')
+      shell: bash
+      env:
+        REGISTRIES: ${{ inputs.registries }}
+        PAYLOADS: ${{ inputs.payloads }}
+      run: |
+        set -euo pipefail
+        if [ -n "$REGISTRIES" ]; then
+          while IFS= read -r line; do
+            ref="$(printf '%s' "$line" | tr -d '\r' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+            [ -n "$ref" ] || continue
+            case "$ref" in \#*) continue ;; esac
+            echo "::group::tebako add-registry $ref"
+            tebako add-registry "$ref" || { echo "::error::RegistryAddFailed: tebako add-registry $ref"; exit 1; }
+            echo "::endgroup::"
+          done <<< "$REGISTRIES"
+        fi
+        if [ -n "$PAYLOADS" ]; then
+          while IFS= read -r line; do
+            ref="$(printf '%s' "$line" | tr -d '\r' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+            [ -n "$ref" ] || continue
+            case "$ref" in \#*) continue ;; esac
+            echo "::group::tebako install $ref"
+            tebako install "$ref" || { echo "::error::PayloadInstallFailed: tebako install $ref"; exit 1; }
+            echo "::endgroup::"
+          done <<< "$PAYLOADS"
+        fi
+        echo "::group::Installed shims (informational)"
+        ls -la "$HOME/.tebako/shims" 2>/dev/null || echo "(no shims registered)"
+        echo "::endgroup::"
+
+    - name: Register registries + install payloads
+      if: runner.os == 'Windows' && (inputs.registries != '' || inputs.payloads != '')
+      shell: pwsh
+      env:
+        REGISTRIES: ${{ inputs.registries }}
+        PAYLOADS: ${{ inputs.payloads }}
+      run: |
+        $ErrorActionPreference = 'Stop'
+        foreach ($line in ($env:REGISTRIES -split "`n")) {
+          $ref = $line.Trim()
+          if (-not $ref -or $ref.StartsWith('#')) { continue }
+          Write-Host "::group::tebako add-registry $ref"
+          & tebako add-registry $ref
+          if ($LASTEXITCODE -ne 0) { Write-Host "::error::RegistryAddFailed: tebako add-registry $ref"; exit 1 }
+          Write-Host "::endgroup::"
+        }
+        foreach ($line in ($env:PAYLOADS -split "`n")) {
+          $ref = $line.Trim()
+          if (-not $ref -or $ref.StartsWith('#')) { continue }
+          Write-Host "::group::tebako install $ref"
+          & tebako install $ref
+          if ($LASTEXITCODE -ne 0) { Write-Host "::error::PayloadInstallFailed: tebako install $ref"; exit 1 }
+          Write-Host "::endgroup::"
+        }
+        Write-Host "::group::Installed shims (informational)"
+        $tebakoHome = if ($env:LOCALAPPDATA) { Join-Path $env:LOCALAPPDATA 'tebako' } else { Join-Path $env:USERPROFILE '.tebako' }
+        $shims = Join-Path $tebakoHome 'shims'
+        if (Test-Path $shims) { Get-ChildItem $shims | Format-Table -AutoSize | Out-String | Write-Host } else { Write-Host '(no shims registered)' }
+        Write-Host "::endgroup::"
