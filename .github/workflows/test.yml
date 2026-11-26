@@ -5,7 +5,9 @@ name: test
 # registry, installs the published hello payload (kind: toolkit — no
 # runtime download), and dispatches it through the registered shim. A
 # second in-job install proves the store path (already-installed is a
-# no-op re-download). The cache-hit job then restores the exact store
+# no-op re-download). On POSIX legs `tfs exec` proves the preload shim
+# the action placed (tebako#1099 — probe-gated while 'latest' predates
+# the shim asset). The cache-hit job then restores the exact store
 # key a previous job in this run saved — the living proof that
 # actions/cache's post-job save fires from inside a composite action.
 #
@@ -87,6 +89,29 @@ jobs:
           set -euo pipefail
           command -v tebako
           tebako --version
+
+      - name: tfs exec runs through the placed preload shim (posix)
+        # tebako#1099's stranger-lane proof: the action placed
+        # libtfs_preload beside tfs, so `tfs exec` mounts and runs with
+        # zero compilation. Probe-gated (the release-train's flip
+        # window): while 'latest' resolves to a release predating the
+        # shim asset this skips loudly, it does not fail.
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$(dirname "$(command -v tfs)")"
+          if ! ls "$root"/libtfs_preload.* >/dev/null 2>&1; then
+            echo "::warning::no libtfs_preload beside $root/tfs — the resolved release predates the shim asset (flip window); skipping the exec proof"
+            exit 0
+          fi
+          work="$(mktemp -d)"
+          mkdir "$work/src"
+          echo hello-from-the-vfs > "$work/src/hello.txt"
+          tfs mkimage "$work/src" --output "$work/img.tfs"
+          T=/bin/true; [ -x "$T" ] || T=/usr/bin/true
+          tfs exec "$work/img.tfs" -- "$T"
+          echo "tfs exec mounted and ran through $root/libtfs_preload.*"
 
       - name: tebako --version answers (windows)
         if: runner.os == 'Windows'

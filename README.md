@@ -3,16 +3,16 @@
 [![test](https://github.com/tamatebako/setup-tebako/actions/workflows/test.yml/badge.svg)](https://github.com/tamatebako/setup-tebako/actions/workflows/test.yml)
 
 GitHub Action: install the [tebako](https://github.com/tamatebako/tebako)
-CLI in one step — version-pinnable, sha256-verified against the release's
-own `SHA256SUMS` — with the tebako store cached across runs and optional
-payload installs.
+CLI and the `tfs` filesystem tool in one step — version-pinnable,
+sha256-verified against the release's own `SHA256SUMS` — with the tebako
+store cached across runs and optional payload installs.
 
 ```yaml
 - uses: tamatebako/setup-tebako@v1
 ```
 
-After the step, `tebako` is on `PATH` and so is the store's `shims/`
-directory, so installed payload commands dispatch directly:
+After the step, `tebako` and `tfs` are on `PATH` and so is the store's
+`shims/` directory, so installed payload commands dispatch directly:
 
 ```yaml
 - uses: tamatebako/setup-tebako@v1
@@ -45,15 +45,19 @@ directory, so installed payload commands dispatch directly:
 1. **Resolves the version.** `latest` follows the
    `releases/latest` redirect (no rate-limited API call); an explicit
    version pins the release verbatim.
-2. **Downloads and verifies.** Fetches `tebako` and `tebako-shim` for
-   the runner's platform from the release and sha256-verifies both
-   against the release's own `SHA256SUMS`. A mismatch fails closed with
-   a named `ChecksumMismatch` error; a release whose sums lack the
-   asset's row fails with `ChecksumPinMissing`.
-3. **Installs.** Places the CLI and the shim side by side under the
-   runner tool cache (the shim's dispatcher resolution is sibling-wise)
-   and adds that directory **and** the store's `shims/` directory to
-   `PATH`.
+2. **Downloads and verifies.** Fetches `tebako`, `tebako-shim`, and
+   `tfs` for the runner's platform from the release and sha256-verifies
+   them against the release's own `SHA256SUMS`. A mismatch fails closed
+   with a named `ChecksumMismatch` error; a release whose sums lack the
+   asset's row fails with `ChecksumPinMissing`. On POSIX the step also
+   fetches the `libtfs_preload` shim library — `tfs exec`'s delivery —
+   when the release carries it; releases up to v2.8.85 predate the
+   asset, and there the step warns loudly and skips the library instead
+   of failing (the tools still install).
+3. **Installs.** Places the CLI, the shim, and `tfs` side by side under
+   the runner tool cache (the shim's dispatcher resolution and `tfs
+   exec`'s preload-shim lookup are both sibling-wise) and adds that
+   directory **and** the store's `shims/` directory to `PATH`.
 4. **Registers registries and installs payloads**, one `tebako
    add-registry` / `tebako install` per input line, then lists the
    registered shims for the log.
@@ -62,7 +66,9 @@ Platform mapping: Linux x86_64/arm64 (glibc, or musl when `ldd` reports
 musl), macOS x86_64/arm64, Windows `ucrt64`. The release ships the CLI
 pair for Windows x86_64 only — on Windows ARM64 runners the action warns
 loudly and installs the x64 asset, which runs under Windows-on-ARM
-emulation.
+emulation. The preload shim library is POSIX-only (its mechanism is
+`LD_PRELOAD`/`DYLD_INSERT_LIBRARIES`), so the Windows leg places no
+library — `tfs exec` there answers its own named not-supported error.
 
 ## Caching
 

@@ -151,10 +151,28 @@ runs:
         work="$(mktemp -d)"
         trap 'rm -rf "$work"' EXIT
         cd "$work"
-        assets=("tebako-$ver-$plat" "tebako-shim-$ver-$plat")
+        assets=("tebako-$ver-$plat" "tebako-shim-$ver-$plat" "tfs-$ver-$plat")
+        # The preload shim library (tfs exec's delivery, tebako#1099) is
+        # POSIX-only and joined the release asset set after v2.8.85:
+        # probe-gate on the SHA256SUMS row — a release predating it warns
+        # loudly instead of failing (the tools still install), exactly
+        # the release-train's flip-window discipline.
+        case "$RUNNER_OS" in
+          macOS) libext="dylib" ;;
+          *)     libext="so" ;;
+        esac
+        libasset="libtfs_preload-$ver-$plat.$libext"
+        have_lib=""
         for a in "${assets[@]}" SHA256SUMS; do
           curl -fsSLO --retry 5 --retry-all-errors --retry-delay 3 "$base/$a"
         done
+        if grep -q "  $libasset\$" SHA256SUMS; then
+          assets+=("$libasset")
+          have_lib=1
+          curl -fsSLO --retry 5 --retry-all-errors --retry-delay 3 "$base/$libasset"
+        else
+          echo "::warning::v$ver predates the preload shim asset ($libasset) — tfs exec needs it; it ships from the first release after v2.8.85"
+        fi
         if command -v sha256sum >/dev/null 2>&1; then sum() { sha256sum "$1"; }
         else sum() { shasum -a 256 "$1"; }
         fi
@@ -167,14 +185,19 @@ runs:
           echo "sha256 OK: $a ($got)"
         done
 
-        # --- install: CLI + shim side by side (the shim's dispatcher ---
-        # --- resolution is sibling-wise) ---
+        # --- install: CLI + shim + tfs side by side (the shim's        ---
+        # --- dispatcher resolution and tfs exec's preload-shim lookup  ---
+        # --- are both sibling-wise)                                    ---
         root="${RUNNER_TOOL_CACHE:-$RUNNER_TEMP/tebako-toolcache}/tebako/$ver/$RUNNER_ARCH"
         mkdir -p "$root"
         chmod +x "${assets[@]}"
         mv "tebako-$ver-$plat" "$root/tebako"
         mv "tebako-shim-$ver-$plat" "$root/tebako-shim"
-        echo "installed: $root/tebako ($(wc -c < "$root/tebako" | tr -d ' ') bytes), $root/tebako-shim"
+        mv "tfs-$ver-$plat" "$root/tfs"
+        if [ -n "$have_lib" ]; then
+          mv "$libasset" "$root/libtfs_preload.$libext"
+        fi
+        echo "installed: $root/tebako ($(wc -c < "$root/tebako" | tr -d ' ') bytes), $root/tebako-shim, $root/tfs$( [ -n "$have_lib" ] && echo ", $root/libtfs_preload.$libext")"
 
         echo "$root" >> "$GITHUB_PATH"
         home="$HOME/.tebako"
@@ -228,7 +251,11 @@ runs:
         New-Item -ItemType Directory -Force -Path $work | Out-Null
         Push-Location $work
         try {
-          $assets = @("tebako-$ver-$plat.exe", "tebako-shim-$ver-$plat.exe")
+          # No preload shim asset here: the shim's delivery is
+          # LD_PRELOAD/DYLD_INSERT_LIBRARIES, a POSIX-only mechanism
+          # (tebako#1099) — `tfs exec` on windows answers its own
+          # not-supported named error, so there is nothing to place.
+          $assets = @("tebako-$ver-$plat.exe", "tebako-shim-$ver-$plat.exe", "tfs-$ver-$plat.exe")
           foreach ($a in @($assets) + @('SHA256SUMS')) {
             & curl.exe -fsSLO --retry 5 --retry-all-errors --retry-delay 3 "$base/$a"
             if ($LASTEXITCODE -ne 0) { Write-Host "::error::DownloadFailed: $base/$a (curl exit $LASTEXITCODE)"; exit 1 }
@@ -244,14 +271,15 @@ runs:
             Write-Host "sha256 OK: $a ($got)"
           }
 
-          # --- install: CLI + shim side by side (the shim's dispatcher ---
-          # --- resolution is sibling-wise) ---
+          # --- install: CLI + shim + tfs side by side (the shim's     ---
+          # --- dispatcher resolution is sibling-wise)                 ---
           $cacheRoot = if ($env:RUNNER_TOOL_CACHE) { $env:RUNNER_TOOL_CACHE } else { Join-Path $env:RUNNER_TEMP 'tebako-toolcache' }
           $root = Join-Path $cacheRoot "tebako\$ver\$env:RUNNER_ARCH"
           New-Item -ItemType Directory -Force -Path $root | Out-Null
           Move-Item -Force "tebako-$ver-$plat.exe" (Join-Path $root 'tebako.exe')
           Move-Item -Force "tebako-shim-$ver-$plat.exe" (Join-Path $root 'tebako-shim.exe')
-          Write-Host "installed: $root\tebako.exe ($((Get-Item (Join-Path $root 'tebako.exe')).Length) bytes), $root\tebako-shim.exe"
+          Move-Item -Force "tfs-$ver-$plat.exe" (Join-Path $root 'tfs.exe')
+          Write-Host "installed: $root\tebako.exe ($((Get-Item (Join-Path $root 'tebako.exe')).Length) bytes), $root\tebako-shim.exe, $root\tfs.exe"
 
           Add-Content $env:GITHUB_PATH $root
           # The store root on Windows is %LOCALAPPDATA%\tebako, with
