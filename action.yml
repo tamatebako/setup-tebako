@@ -1,8 +1,7 @@
 name: setup-tebako
 description: >-
-  Install the tebako CLI (version-pinnable, sha256-verified against the
-  release's own SHA256SUMS), restore the tebako store cache, and
-  optionally register registries and install payloads.
+  Install the tebako CLI (version-pinnable, sha256-verified), restore
+  the store cache, and install payloads.
 author: riboseinc
 branding:
   icon: package
